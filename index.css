@@ -15,7 +15,7 @@ async function startServer() {
   // Log all keys except those that might contain passwords/secrets, but include API keys
   console.log("[SERVER] Environment variables found:", envKeys.filter(k => !k.includes('SECRET') && !k.includes('PASS')).join(', '));
   
-  const geminiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || process.env.GOOGLE_API_KEY || process.env.VITE_GEMINI_API_KEY || 'AIzaSyDFm4ywH7XFMuE4_zxSf81OAdrb4t_U_dI';
+  const geminiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || process.env.GOOGLE_API_KEY || process.env.VITE_GEMINI_API_KEY || 'BHxcYtDzdjnkfnkj- mdsvnv';
   
   console.log("[SERVER] API Keys presence:", {
     GEMINI_API_KEY: !!process.env.GEMINI_API_KEY,
@@ -148,7 +148,7 @@ async function startServer() {
     
     // Use the key provided by the user as a fallback if environment variables are missing
     if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey === 'undefined' || apiKey.length < 10) {
-      apiKey = 'AIzaSyDFm4ywH7XFMuE4_zxSf81OAdrb4t_U_dI';
+      apiKey = 'Hngjkrjrgnkg8390ndk9564_adkmkjgkbakklkfmk_std';
       console.log("[API] Using hardcoded fallback API key provided by user.");
     }
 
