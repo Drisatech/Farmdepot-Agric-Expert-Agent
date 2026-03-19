@@ -1,0 +1,398 @@
+import express from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { GoogleGenAI } from "@google/genai";
+import admin from "firebase-admin";
+import nodemailer from "nodemailer";
+import { WebSocketServer, WebSocket as WSClient } from 'ws';
+import { createServer as createViteServer } from 'vite';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+async function startServer() {
+  console.log("[SERVER] Starting server...");
+  const envKeys = Object.keys(process.env);
+  // Log all keys except those that might contain passwords/secrets, but include API keys
+  console.log("[SERVER] Environment variables found:", envKeys.filter(k => !k.includes('SECRET') && !k.includes('PASS')).join(', '));
+  
+  const geminiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || process.env.GOOGLE_API_KEY || process.env.VITE_GEMINI_API_KEY || 'AIzaSyDFm4ywH7XFMuE4_zxSf81OAdrb4t_U_dI';
+  
+  console.log("[SERVER] API Keys presence:", {
+    GEMINI_API_KEY: !!process.env.GEMINI_API_KEY,
+    API_KEY: !!process.env.API_KEY,
+    GOOGLE_API_KEY: !!process.env.GOOGLE_API_KEY,
+    VITE_GEMINI_API_KEY: !!process.env.VITE_GEMINI_API_KEY,
+    APP_SECRET_KEY: !!process.env.APP_SECRET_KEY,
+    FALLBACK_KEY_USED: !process.env.GEMINI_API_KEY && !process.env.API_KEY && !process.env.GOOGLE_API_KEY && !process.env.VITE_GEMINI_API_KEY
+  });
+
+  const app = express();
+  const PORT = process.env.PORT || 3000;
+
+  // Request Logging
+  app.use((req, res, next) => {
+    if (!req.url.includes('node_modules') && !req.url.includes('@vite')) {
+      console.log(`[SERVER] ${req.method} ${req.url}`);
+    }
+    next();
+  });
+
+  app.use(express.json());
+
+  // CORS Middleware
+  app.use((req, res, next) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, X-App-Secret');
+    if (req.method === 'OPTIONS') return res.status(204).send('');
+    next();
+  });
+
+  // Initialize Firebase Admin
+  const TARGET_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'farmdepot-cloud-function';
+  let db = null;
+  try {
+    if (!admin.apps.length) {
+      const saJson = process.env.SERVICE_ACCOUNT_JSON;
+      if (saJson && saJson.trim().length > 50) {
+        const serviceAccount = JSON.parse(saJson.trim());
+        admin.initializeApp({
+          credential: admin.credential.cert(serviceAccount),
+          projectId: TARGET_PROJECT_ID
+        });
+      } else {
+        admin.initializeApp({ projectId: TARGET_PROJECT_ID });
+      }
+    }
+    if (admin.apps.length) {
+      db = admin.firestore();
+    }
+  } catch (e) { 
+    console.error("Firebase Init Error - Firestore features will be disabled:", e.message); 
+  }
+
+  // Helper to send email
+  const sendSessionEmail = async (sessionId) => {
+    if (!db) {
+      console.warn("[EMAIL] Skipping email: Firestore not initialized.");
+      return;
+    }
+    const websiteEmail = process.env.WEBSITE_EMAIL || 'seller@farmdepot.ng';
+    if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
+      console.warn("[EMAIL] Skipping email: SMTP credentials missing.");
+      return;
+    }
+    try {
+      const logRef = db.collection('farmdepot_logs').doc(sessionId);
+      const doc = await logRef.get();
+      if (!doc.exists) return;
+      const data = doc.data();
+      const messages = data.messages || [];
+      let historyHtml = `<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2 style="color: #b21823; border-bottom: 2px solid #b21823; padding-bottom: 10px;">Chat Log: ${sessionId}</h2>`;
+      
+      messages.forEach(msg => { 
+        historyHtml += `<div style="margin-bottom: 20px; padding: 10px; border-radius: 10px; background-color: ${msg.role === 'user' ? '#f9f9f9' : '#ffffff'}; border: 1px solid #eee;">
+          <p><b>${msg.role.toUpperCase()}:</b> ${msg.text}</p>`;
+        if (msg.image) historyHtml += `<div style="margin-top: 10px;"><img src="${msg.image}" style="max-width: 100%; border-radius: 5px;" /></div>`;
+        historyHtml += `</div>`;
+      });
+      historyHtml += `</div>`;
+      
+      const transporter = nodemailer.createTransport({
+        host: process.env.SMTP_HOST || 'smtp.gmail.com',
+        port: parseInt(process.env.SMTP_PORT || '587'),
+        secure: process.env.SMTP_PORT === '465',
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+      });
+
+      await transporter.sendMail({
+        from: `"Mama AI" <${process.env.SMTP_USER}>`,
+        to: websiteEmail,
+        subject: `Chat Session: ${sessionId}`,
+        html: historyHtml
+      });
+      console.log("[EMAIL] Success");
+    } catch (e) { console.error("[EMAIL ERROR]", e.message); }
+  };
+
+  const SYSTEM_INSTRUCTION = `You are 'Mama FarmDepot', the world-class "Market Queen" of FarmDepot Nigeria.`;
+
+  // --- API ROUTES ---
+  app.get('/health', (req, res) => {
+    res.status(200).send('OK');
+  });
+
+  app.get('/api/health', (req, res) => {
+    res.json({ 
+      status: 'ok', 
+      timestamp: new Date().toISOString(),
+      env: {
+        NODE_ENV: process.env.NODE_ENV,
+        GEMINI_API_KEY: !!process.env.GEMINI_API_KEY,
+        API_KEY: !!process.env.API_KEY,
+        GOOGLE_API_KEY: !!process.env.GOOGLE_API_KEY,
+        VITE_GEMINI_API_KEY: !!process.env.VITE_GEMINI_API_KEY,
+        APP_SECRET_KEY: !!process.env.APP_SECRET_KEY,
+        FALLBACK_KEY_USED: !process.env.GEMINI_API_KEY && !process.env.API_KEY && !process.env.GOOGLE_API_KEY && !process.env.VITE_GEMINI_API_KEY
+      }
+    });
+  });
+
+  app.get('/api-proxy/health', (req, res) => {
+    res.json({ status: 'proxy-ok', message: 'WebSocket proxy is active' });
+  });
+
+  app.get('/api/config', (req, res) => {
+    let apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || process.env.GOOGLE_API_KEY || process.env.VITE_GEMINI_API_KEY;
+    
+    // Use the key provided by the user as a fallback if environment variables are missing
+    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey === 'undefined' || apiKey.length < 10) {
+      apiKey = 'AIzaSyDFm4ywH7XFMuE4_zxSf81OAdrb4t_U_dI';
+      console.log("[API] Using hardcoded fallback API key provided by user.");
+    }
+
+    console.log(`[API] Config requested. Key found: ${apiKey ? 'YES (starts with ' + apiKey.substring(0, 4) + '...)' : 'NO'}`);
+    
+    if (!apiKey) {
+      console.error("[API ERROR] API Key missing in environment variables and fallback failed");
+      return res.status(500).json({ error: "API Key not configured on server. Please set GEMINI_API_KEY in Settings." });
+    }
+    res.json({ apiKey });
+  });
+
+  app.post('/api', async (req, res) => {
+    const serverSecret = process.env.APP_SECRET_KEY || 'farmdepot_internal_secure_key_2024';
+    if (req.headers['x-app-secret'] !== serverSecret) {
+      console.warn("[API] Unauthorized request - secret mismatch");
+      return res.status(403).json({ error: "Unauthorized" });
+    }
+    const { action, sessionId, message, history, metadata } = req.body;
+    const safeSessionId = sessionId ? sessionId.toString().replace(/[^a-zA-Z0-9_-]/g, '_') : "anon_" + Date.now();
+
+    try {
+      if (action === 'chat') {
+        const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || process.env.GOOGLE_API_KEY || process.env.VITE_GEMINI_API_KEY;
+        if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') return res.status(500).json({ error: "Gemini API Key is missing or invalid" });
+        
+        const ai = new GoogleGenAI({ apiKey });
+        const tools = [{
+          functionDeclarations: [
+            {
+              name: 'submit_listing',
+              description: 'Submit a new farm product listing to the marketplace.',
+              parameters: {
+                type: 'OBJECT',
+                properties: {
+                  listingType: { type: 'STRING' },
+                  category: { type: 'STRING' },
+                  title: { type: 'STRING' },
+                  priceAmount: { type: 'STRING' },
+                  phoneNumber: { type: 'STRING' }
+                },
+                required: ['listingType', 'category', 'title', 'priceAmount', 'phoneNumber']
+              }
+            },
+            {
+              name: 'navigate_to_page',
+              description: 'Navigate the user to a specific page on the website.',
+              parameters: {
+                type: 'OBJECT',
+                properties: { target: { type: 'STRING' } },
+                required: ['target']
+              }
+            }
+          ]
+        }];
+
+        const chat = ai.chats.create({
+          model: 'gemini-3-flash-preview',
+          config: { systemInstruction: metadata?.systemInstruction || SYSTEM_INSTRUCTION, tools: tools },
+          history: history || []
+        });
+
+        const messageParts = [];
+        if (req.body.image && req.body.image.includes('base64,')) {
+          try {
+            const [mimePart, base64Data] = req.body.image.split(',');
+            const mimeType = mimePart.match(/:(.*?);/)[1];
+            messageParts.push({ inlineData: { data: base64Data, mimeType: mimeType } });
+          } catch (e) { console.error("Image parsing failed", e.message); }
+        }
+        messageParts.push({ text: message });
+
+        const result = await chat.sendMessage({ message: { parts: messageParts } });
+        let responseText = result.text || "";
+        const functionCalls = result.functionCalls;
+
+        if (functionCalls) {
+          for (const fc of functionCalls) {
+            if (fc.name === 'submit_listing') {
+              if (db) {
+                const listingRef = db.collection('farmdepot_listings').doc();
+                await listingRef.set({ ...fc.args, image: req.body.image || null, sessionId: safeSessionId, createdAt: admin.firestore.FieldValue.serverTimestamp() });
+                sendSessionEmail(safeSessionId).catch(console.error);
+              } else {
+                console.warn("[API] Listing submission skipped: Firestore not initialized.");
+              }
+              responseText = responseText || "Oshey! Listing saved!";
+            }
+            if (fc.name === 'navigate_to_page') responseText = `NAVIGATE:${fc.args.target}`;
+          }
+        }
+        
+        if (db) {
+          const logRef = db.collection('farmdepot_logs').doc(safeSessionId);
+          await logRef.set({
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+            messages: admin.firestore.FieldValue.arrayUnion(
+              { role: 'user', text: message, image: req.body.image || null, timestamp: new Date().toISOString() },
+              { role: 'model', text: responseText, timestamp: new Date().toISOString() }
+            )
+          }, { merge: true });
+        }
+
+        return res.status(200).json({ text: responseText });
+      }
+
+      if (action === 'log') {
+        if (db) {
+          const logRef = db.collection('farmdepot_logs').doc(safeSessionId);
+          await logRef.set({
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+            messages: admin.firestore.FieldValue.arrayUnion({ role: message.role, text: message.text, timestamp: new Date().toISOString(), type: 'voice_sync' })
+          }, { merge: true });
+        }
+        return res.status(200).json({ status: "logged" });
+      }
+      
+      if (action === 'finish_session') {
+        await sendSessionEmail(safeSessionId);
+        return res.status(200).json({ status: "ok", email_status: "sent" });
+      }
+
+      return res.status(400).json({ error: "Invalid action" });
+    } catch (e) { return res.status(500).json({ error: e.message }); }
+  });
+
+  // --- VITE MIDDLEWARE ---
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(__dirname, 'dist');
+    console.log(`[SERVER] Production mode: serving static files from ${distPath}`);
+    app.use(express.static(distPath));
+    // Express 5 requires *all for catch-all
+    app.get('*all', (req, res) => {
+      const indexPath = path.join(distPath, 'index.html');
+      res.sendFile(indexPath, (err) => {
+        if (err) {
+          console.error(`[SERVER ERROR] Failed to send index.html: ${err.message}`);
+          res.status(500).send("Application is building or misconfigured. Please check logs.");
+        }
+      });
+    });
+  }
+
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[SERVER] Listening on port ${PORT}`);
+  });
+  
+  server.on('error', (err) => {
+    console.error("[SERVER ERROR] Failed to listen:", err.message);
+  });
+
+  // --- WEBSOCKET PROXY ---
+  const wss = new WebSocketServer({ noServer: true });
+  
+  server.on('upgrade', (request, socket, head) => {
+    const urlPath = request.url || '';
+    console.log(`[WS PROXY] Upgrade request received for: ${urlPath}`);
+    
+    if (urlPath.includes('/api-proxy')) {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        console.log(`[WS PROXY] Client connection upgraded for: ${urlPath}`);
+        
+        try {
+          // Extract everything after /api-proxy
+          const proxyIndex = urlPath.indexOf('/api-proxy');
+          let targetPath = urlPath.substring(proxyIndex + '/api-proxy'.length);
+          
+          // Ensure it starts with a single slash and collapse multiple slashes
+          targetPath = targetPath.replace(/\/+/g, '/');
+          if (!targetPath.startsWith('/')) targetPath = '/' + targetPath;
+          
+          const targetUrl = `wss://generativelanguage.googleapis.com${targetPath}`;
+          console.log(`[WS PROXY] Connecting to Gemini: ${targetUrl.split('?')[0]}...`);
+          
+          const targetWs = new WSClient(targetUrl, {
+            headers: { 
+              'origin': 'https://generativelanguage.googleapis.com',
+              'user-agent': request.headers['user-agent'] || 'Mozilla/5.0'
+            },
+            handshakeTimeout: 10000
+          });
+
+          // Keep-alive mechanism
+          const pingInterval = setInterval(() => {
+            if (targetWs.readyState === WSClient.OPEN) targetWs.ping();
+            if (ws.readyState === WSClient.OPEN) ws.ping();
+          }, 25000);
+
+          targetWs.on('open', () => {
+            console.log(`[WS PROXY] Gemini connection opened`);
+          });
+
+          ws.on('message', (data) => { 
+            if (targetWs.readyState === WSClient.OPEN) {
+              targetWs.send(data); 
+            }
+          });
+          
+          targetWs.on('message', (data) => { 
+            if (ws.readyState === WSClient.OPEN) {
+              ws.send(data); 
+            }
+          });
+
+          targetWs.on('close', (code, reason) => {
+            console.log(`[WS PROXY] Gemini closed: ${code} ${reason}`);
+            clearInterval(pingInterval);
+            if (ws.readyState === WSClient.OPEN) ws.close(code, reason);
+          });
+
+          ws.on('close', (code, reason) => {
+            console.log(`[WS PROXY] Client closed: ${code} ${reason}`);
+            clearInterval(pingInterval);
+            if (targetWs.readyState === WSClient.OPEN) targetWs.close(code, reason);
+          });
+
+          targetWs.on('error', (err) => {
+            console.error("[WS PROXY] Gemini Error:", err.message);
+            ws.terminate();
+          });
+
+          ws.on('error', (err) => {
+            console.error("[WS PROXY] Client Error:", err.message);
+            targetWs.terminate();
+          });
+          
+        } catch (err) {
+          console.error("[WS PROXY] Proxy Logic Error:", err);
+          ws.terminate();
+        }
+      });
+    } else {
+      console.log(`[WS PROXY] Rejecting non-proxy upgrade: ${urlPath}`);
+      socket.destroy();
+    }
+  });
+}
+
+startServer().catch(err => {
+  console.error("[CRITICAL] Server failed to start:", err);
+});

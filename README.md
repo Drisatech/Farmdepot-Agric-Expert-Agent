@@ -1,0 +1,8 @@
+{
+  "name": "FarmDepot_Chatbot",
+  "description": "A multilingual voice-enabled AI assistant for the FarmDepot agricultural marketplace, supporting English, Hausa, Igbo, Yoruba, and Nigerian Pidgin.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ]
+}
